@@ -182,6 +182,11 @@
 
   // ---- DOM matching ---------------------------------------------------------
 
+  const DEBUG = true;
+  function dbg(...args) {
+    if (DEBUG) console.log("[TFMM]", ...args);
+  }
+
   const TOGGLE_SELECTORS = [
     'input[type="checkbox"]',
     '[role="switch"]',
@@ -191,8 +196,103 @@
     'button[data-state="checked"]',
     '[data-state="unchecked"]',
     '[data-state="checked"]',
+    'button[class*="toggle" i]',
+    'button[class*="switch" i]',
+    '[class*="Switch" i] input',
+    '[class*="Toggle" i] input',
   ];
   const TOGGLE_QUERY = TOGGLE_SELECTORS.join(",");
+
+  // Dispatch a real pointer event sequence — React/Radix/Headless UI often
+  // ignore synthetic .click() calls. Also tries keyboard activation for
+  // role=switch buttons and the React-aware setter for checkbox inputs.
+  function synthClick(el) {
+    if (!el) return;
+    try {
+      el.focus?.();
+    } catch {
+      /* ignore */
+    }
+    const opts = { bubbles: true, cancelable: true, composed: true };
+    const safeDispatch = (ev) => {
+      try {
+        el.dispatchEvent(ev);
+      } catch {
+        /* ignore */
+      }
+    };
+    safeDispatch(new PointerEvent("pointerdown", opts));
+    safeDispatch(new MouseEvent("mousedown", opts));
+    safeDispatch(new PointerEvent("pointerup", opts));
+    safeDispatch(new MouseEvent("mouseup", opts));
+    safeDispatch(new MouseEvent("click", opts));
+    try {
+      el.click?.();
+    } catch {
+      /* ignore */
+    }
+
+    // Radix / HeadlessUI switches respond to Space and Enter.
+    const role = el.getAttribute && el.getAttribute("role");
+    if (
+      role === "switch" ||
+      role === "checkbox" ||
+      el.tagName === "BUTTON"
+    ) {
+      safeDispatch(
+        new KeyboardEvent("keydown", { ...opts, key: " ", code: "Space" }),
+      );
+      safeDispatch(
+        new KeyboardEvent("keyup", { ...opts, key: " ", code: "Space" }),
+      );
+    }
+
+    // React-managed <input type="checkbox">: bypass the React onChange noop
+    // by writing through the native setter.
+    if (el instanceof HTMLInputElement && el.type === "checkbox") {
+      try {
+        const setter = Object.getOwnPropertyDescriptor(
+          HTMLInputElement.prototype,
+          "checked",
+        )?.set;
+        setter?.call(el, !el.checked);
+        safeDispatch(new Event("input", { bubbles: true }));
+        safeDispatch(new Event("change", { bubbles: true }));
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  // Verify whether a click actually changed the toggle. Tries clicking the
+  // parent element too if the first attempt didn't take.
+  function clickAndVerify(toggle, label) {
+    const before = isOn(toggle);
+    synthClick(toggle);
+    setTimeout(() => {
+      const after = isOn(toggle);
+      if (after === before) {
+        dbg("first click did not change state for", label, "— trying parent");
+        const parent = toggle.parentElement;
+        if (parent) synthClick(parent);
+        setTimeout(() => {
+          const after2 = isOn(toggle);
+          if (after2 === before) {
+            dbg(
+              "STILL did not change for",
+              label,
+              "| toggle:",
+              toggle.outerHTML?.slice(0, 200),
+            );
+          } else {
+            dbg("parent click worked for", label);
+          }
+        }, 150);
+      } else {
+        dbg("click changed state for", label, "before:", before, "after:", after);
+      }
+    }, 200);
+  }
 
   function isOn(el) {
     if (!el) return false;
@@ -265,11 +365,7 @@
         maybeFinish();
         return;
       }
-      try {
-        toggle.click();
-      } catch {
-        /* ignore */
-      }
+      synthClick(toggle);
       setTimeout(() => {
         if (isOn(toggle)) {
           state.set(target, "done");
@@ -305,32 +401,70 @@
     return null;
   }
 
-  function looksLikeToolName(text) {
-    const norm = normalize(text);
-    if (norm.length < 3 || norm.length > 60) return false;
-    // After normalize() underscores became spaces; treat anything 1–6 words of
-    // lowercase identifier-ish text as a tool name candidate.
-    return /^[a-z][a-z0-9 ]{2,}$/.test(norm) && norm.split(/\s+/).length <= 6;
+  function looksLikeToolName(rawText) {
+    const t = (rawText || "").trim();
+    if (t.length < 3 || t.length > 80) return false;
+    if (/[.!?]/.test(t)) return false; // sentence-shaped — skip
+    // snake_case API names: create_pull_request, get_repo
+    if (/^[a-z][a-z0-9_]+$/.test(t)) return true;
+    // camelCase: createPullRequest, listIssues
+    if (/^[a-z]+([A-Z][a-z0-9]+){1,5}$/.test(t)) return true;
+    // Title Case phrase, 2–5 words: "Create Pull Request"
+    if (/^[A-Z][a-zA-Z0-9]+(\s[A-Z]?[a-zA-Z0-9]+){1,4}$/.test(t)) return true;
+    // all-lowercase phrase: "create pull request"
+    if (/^[a-z]+(\s[a-z]+){1,4}$/.test(t)) return true;
+    return false;
   }
 
   function disableNonTargets() {
     const targetSet = new Set(targets.map(normalize));
     const toggles = document.querySelectorAll(TOGGLE_QUERY);
+    dbg(
+      "disable sweep: found",
+      toggles.length,
+      "toggle candidates on page",
+    );
     let count = 0;
+    let skippedNoLabel = 0;
+    let skippedInTarget = 0;
+    let skippedNotToolish = 0;
+    const seenLabels = new Set();
     for (const toggle of toggles) {
-      if (!isOn(toggle)) continue;
       const label = nearbyLabel(toggle);
-      if (!label || !looksLikeToolName(label)) continue;
-      const norm = normalize(label);
-      if (targetSet.has(norm)) continue;
-      try {
-        toggle.click();
-        count++;
-      } catch {
-        /* ignore */
+      if (!label) {
+        skippedNoLabel++;
+        continue;
       }
+      if (!looksLikeToolName(label)) {
+        skippedNotToolish++;
+        dbg("skip: label not tool-shaped", JSON.stringify(label));
+        continue;
+      }
+      const norm = normalize(label);
+      if (targetSet.has(norm)) {
+        skippedInTarget++;
+        continue;
+      }
+      // Dedup by label so we don't click 2 toggles for the same row.
+      if (seenLabels.has(norm)) continue;
+      seenLabels.add(norm);
+
+      dbg("disable click →", label, "(on?", isOn(toggle), ")");
+      clickAndVerify(toggle, label);
+      count++;
       if (count >= 40) break;
     }
+    dbg(
+      "disable sweep results:",
+      "clicked",
+      count,
+      "| skipped no-label:",
+      skippedNoLabel,
+      "| skipped in-target:",
+      skippedInTarget,
+      "| skipped non-tool:",
+      skippedNotToolish,
+    );
     return count;
   }
 
@@ -391,11 +525,8 @@
       const btn = findConfirmButton(dlg);
       if (!btn) continue;
       confirmed.add(dlg);
-      try {
-        btn.click();
-      } catch {
-        /* ignore */
-      }
+      dbg("auto-confirming dialog button:", btn.innerText || btn.textContent);
+      synthClick(btn);
     }
   }
 
@@ -419,14 +550,12 @@
     // Proof-of-life fallback: if nothing else changed, flip the first ON
     // toggle so the user sees the extension worked.
     const toggles = document.querySelectorAll(TOGGLE_QUERY);
+    dbg("forceFlipOne: scanning", toggles.length, "toggles");
     for (const toggle of toggles) {
       if (!isOn(toggle)) continue;
-      try {
-        toggle.click();
-        return true;
-      } catch {
-        /* ignore */
-      }
+      dbg("forceFlipOne: flipping", toggle);
+      synthClick(toggle);
+      return true;
     }
     return false;
   }
@@ -462,13 +591,15 @@
       const enabledCount = [...state.values()].filter(
         (v) => v === "done",
       ).length;
-      if (enabledCount === 0 && disabled === 0) {
+      if (disabled === 0 && enabledCount === 0) {
         const flipped = forceFlipOne();
         subEl.textContent = flipped
           ? `${label} applied — no exact matches yet, flipped one toggle as a proof.`
           : `${label} applied — couldn't find any toggles on this page.`;
       } else if (disabled > 0) {
-        subEl.textContent = `${label} applied — ${enabledCount} enabled, ${disabled} disabled (least-privilege).`;
+        subEl.textContent = `${label} applied — ${enabledCount} kept on, ${disabled} disabled (least-privilege).`;
+      } else {
+        subEl.textContent = `${label} applied — ${enabledCount} matched, nothing extra to disable.`;
       }
     }, 4500);
 

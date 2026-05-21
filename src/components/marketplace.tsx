@@ -255,17 +255,17 @@ export function Marketplace() {
             </p>
           </div>
 
-          <div className="flex w-full max-w-2xl flex-col gap-3 rounded-2xl border border-white/10 bg-white/[0.03] p-3 shadow-2xl shadow-black/40 backdrop-blur sm:flex-row sm:items-center">
-            <div className="flex flex-1 items-center gap-2 rounded-xl bg-black/40 px-3">
+          <div className="flex w-full max-w-2xl flex-col gap-3 rounded-2xl border border-white/10 bg-white/[0.03] p-2 shadow-2xl shadow-black/40 backdrop-blur sm:flex-row sm:items-center">
+            <div className="flex flex-1 items-center gap-2 px-3">
               <Search className="size-4 shrink-0 text-white/40" />
-              <Input
+              <input
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
                 onKeyDown={(event) => {
                   if (event.key === "Enter") handleRecommend();
                 }}
                 placeholder="Describe what you want to build..."
-                className="h-12 border-0 bg-transparent text-base text-white placeholder:text-white/40 focus-visible:ring-0 focus-visible:ring-offset-0"
+                className="h-12 w-full bg-transparent text-base text-white outline-none placeholder:text-white/40"
               />
             </div>
             <Button
