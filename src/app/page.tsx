@@ -22,9 +22,11 @@ export default function Home() {
         <div className="mx-auto flex w-full max-w-6xl items-center justify-between px-6 py-4">
           <Link href="/" className="flex items-center gap-2">
             <span className="inline-flex size-7 items-center justify-center rounded-lg border border-white/15 bg-white text-black font-mono text-xs font-bold">
-              M
+              T
             </span>
-            <span className="font-semibold tracking-tight">MCPacks</span>
+            <span className="font-semibold tracking-tight">
+              TrueFoundryMCPMarketPlace
+            </span>
           </Link>
           <nav className="flex items-center gap-2 text-sm text-white/60">
             <a
@@ -70,7 +72,7 @@ export default function Home() {
             Built for the TrueFoundry Production Agents · MCP Mini Hack
           </span>
           <span className="font-mono text-xs">
-            mcpacks · v0.1 · hackathon edition
+            truefoundrymcpmarketplace · v0.1 · hackathon edition
           </span>
         </div>
       </footer>

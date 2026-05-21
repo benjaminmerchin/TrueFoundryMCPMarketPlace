@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "MCPacks for TrueFoundry",
+  "version": "0.1.0",
+  "description": "Auto-enables the MCP tools selected in MCPacks on the TrueFoundry MCP Gateway.",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.truefoundry.cloud/*",
+        "https://*.truefoundry.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "host_permissions": [
+    "https://*.truefoundry.cloud/*",
+    "https://*.truefoundry.com/*"
+  ]
+}

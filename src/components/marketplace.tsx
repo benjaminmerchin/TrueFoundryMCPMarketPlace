@@ -6,8 +6,10 @@ import {
   ArrowRight,
   Check,
   Copy,
+  ExternalLink,
   Plus,
   Search,
+  ShieldAlert,
   Sparkles,
   Wand2,
   X,
@@ -25,30 +27,52 @@ import {
 import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
-import { PACKS, type Pack, recommendPack } from "@/lib/packs";
+import {
+  countServers,
+  groupToolsByServer,
+  PACKS,
+  type Pack,
+  type Risk,
+  type Tool,
+  recommendPack,
+} from "@/lib/packs";
 
-type ToolState = {
-  id: string;
-  name: string;
+const TRUEFOUNDRY_GATEWAY_URL =
+  "https://dalta.truefoundry.cloud/llm-gateway/mcp-servers";
+const TRUEFOUNDRY_MCP_SERVER_ID = "dbl9pru86y9okd6afkr8g4v7";
+
+type ToolState = Tool & {
   enabled: boolean;
   custom?: boolean;
 };
 
-function slugify(value: string) {
+function packToToolState(pack: Pack): ToolState[] {
+  return pack.tools.map((tool) => ({ ...tool, enabled: true }));
+}
+
+function slugifySegment(value: string) {
   return value
     .toLowerCase()
     .trim()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
 }
 
-function packDefaultTools(pack: Pack): ToolState[] {
-  return pack.tools.map((tool) => ({
-    id: tool.id,
-    name: tool.name,
-    enabled: true,
-  }));
-}
+const RISK_STYLES: Record<Risk, { label: string; className: string }> = {
+  read: {
+    label: "read",
+    className:
+      "border-emerald-400/25 bg-emerald-400/10 text-emerald-200",
+  },
+  write: {
+    label: "write",
+    className: "border-amber-400/25 bg-amber-400/10 text-amber-200",
+  },
+  destructive: {
+    label: "destructive",
+    className: "border-rose-500/30 bg-rose-500/10 text-rose-200",
+  },
+};
 
 export function Marketplace() {
   const [query, setQuery] = useState("");
@@ -64,7 +88,7 @@ export function Marketplace() {
 
   function handleSelectPack(pack: Pack) {
     setSelectedId(pack.id);
-    setTools(packDefaultTools(pack));
+    setTools(packToToolState(pack));
     setHighlightId(pack.id);
     setTimeout(() => {
       document
@@ -93,6 +117,14 @@ export function Marketplace() {
     );
   }
 
+  function toggleServer(serverId: string, enabled: boolean) {
+    setTools((prev) =>
+      prev.map((tool) =>
+        tool.serverId === serverId ? { ...tool, enabled } : tool,
+      ),
+    );
+  }
+
   function removeTool(id: string) {
     setTools((prev) => prev.filter((tool) => tool.id !== id));
   }
@@ -100,33 +132,65 @@ export function Marketplace() {
   function addCustomTool() {
     const trimmed = customTool.trim();
     if (!trimmed) return;
-    const id = slugify(trimmed);
+    const dotIndex = trimmed.indexOf(".");
+    if (dotIndex <= 0 || dotIndex === trimmed.length - 1) {
+      toast.error("Use the format server.tool_name (e.g. github.archive_repo)");
+      return;
+    }
+    const serverIdRaw = trimmed.slice(0, dotIndex);
+    const toolNameRaw = trimmed.slice(dotIndex + 1);
+    const serverId = slugifySegment(serverIdRaw);
+    const toolName = slugifySegment(toolNameRaw);
+    if (!serverId || !toolName) {
+      toast.error("Couldn't parse that tool name. Try github.archive_repo.");
+      return;
+    }
+    const id = `${serverId}.${toolName}`;
     if (tools.some((tool) => tool.id === id)) {
-      toast.warning(`${trimmed} is already in the pack.`);
+      toast.warning(`${id} is already in the pack.`);
       return;
     }
     setTools((prev) => [
       ...prev,
-      { id, name: trimmed, enabled: true, custom: true },
+      {
+        id,
+        name: toolName,
+        serverId,
+        description: "Custom tool added in the marketplace.",
+        risk: "write",
+        enabled: true,
+        custom: true,
+      },
     ]);
     setCustomTool("");
-    toast.success(`Added ${trimmed}`);
+    toast.success(`Added ${id}`);
   }
+
+  const enabledTools = useMemo(
+    () => tools.filter((tool) => tool.enabled),
+    [tools],
+  );
+
+  const grouped = useMemo(() => groupToolsByServer(tools), [tools]);
 
   const generatedConfig = useMemo(() => {
     if (!selected) return null;
-    const includedTools = tools
-      .filter((tool) => tool.enabled)
-      .map((tool) => tool.id);
+    const byServer: Record<string, { tools: string[] }> = {};
+    for (const tool of enabledTools) {
+      const serverKey = tool.serverId;
+      if (!byServer[serverKey]) byServer[serverKey] = { tools: [] };
+      byServer[serverKey].tools.push(tool.name);
+    }
     return {
       virtual_mcp_server_name: selected.slug,
       description: selected.description,
-      included_mcp_servers: includedTools,
+      mcp_servers: byServer,
+      tool_count: enabledTools.length,
       auth_required: true,
       gateway: "truefoundry-mcp-gateway",
-      status: includedTools.length ? "ready_to_deploy" : "missing_tools",
+      status: enabledTools.length ? "ready_to_deploy" : "missing_tools",
     };
-  }, [selected, tools]);
+  }, [selected, enabledTools]);
 
   const configJson = generatedConfig
     ? JSON.stringify(generatedConfig, null, 2)
@@ -140,6 +204,28 @@ export function Marketplace() {
     } catch {
       toast.error("Couldn't copy — your browser blocked clipboard access.");
     }
+  }
+
+  const trueFoundryUrl = useMemo(() => {
+    if (!selected || enabledTools.length === 0) return null;
+    // Encode every enabled tool's bare name so the content script can match
+    // against whichever MCP server page the user opens.
+    const names = Array.from(new Set(enabledTools.map((tool) => tool.name)));
+    const hash = `mcpacks=${names
+      .map((n) => encodeURIComponent(n))
+      .join(",")}`;
+    return `${TRUEFOUNDRY_GATEWAY_URL}?id=${TRUEFOUNDRY_MCP_SERVER_ID}&mcp-server-tab=tools#${hash}`;
+  }, [selected, enabledTools]);
+
+  function openInTrueFoundry() {
+    if (!trueFoundryUrl) {
+      toast.info("Enable at least one tool before opening.");
+      return;
+    }
+    window.open(trueFoundryUrl, "_blank", "noopener,noreferrer");
+    toast.success("Opening TrueFoundry…", {
+      description: "Install the marketplace extension to auto-tick tools.",
+    });
   }
 
   return (
@@ -160,12 +246,12 @@ export function Marketplace() {
               Built on the TrueFoundry MCP Gateway
             </Badge>
             <h1 className="max-w-3xl text-balance text-4xl font-semibold tracking-tight text-white sm:text-6xl">
-              MCP starter packs for AI builders
+              Pick the tools your agent gets — not the whole MCP.
             </h1>
             <p className="max-w-2xl text-balance text-base text-white/60 sm:text-lg">
-              Choose a prebuilt MCP stack, refine it, and deploy it through
-              TrueFoundry. Pre-wired tools for the agents you're already
-              building.
+              Curated tool packs across the MCPs you already use. Toggle each
+              tool, enforce least-privilege, and route it all through the
+              TrueFoundry MCP Gateway.
             </p>
           </div>
 
@@ -195,7 +281,7 @@ export function Marketplace() {
           <div className="flex flex-wrap items-center gap-2 text-xs text-white/40">
             <span className="text-white/30">Try:</span>
             {[
-              "code reviewer agent",
+              "openclaw agent",
               "research analyst",
               "stripe + supabase",
               "customer support",
@@ -230,11 +316,11 @@ export function Marketplace() {
             <Separator className="flex-1 bg-white/5" />
           </div>
           <h2 className="text-2xl font-semibold text-white sm:text-3xl">
-            Pick a pack, ship in minutes
+            Curated tool packs, ready to govern
           </h2>
           <p className="max-w-2xl text-white/60">
-            Every pack is a curated set of MCP servers, ready to route through
-            the TrueFoundry MCP Gateway with auth and policy in place.
+            Every pack is a hand-picked set of tools across multiple MCPs. Drop
+            one in, refine the surface area, and route it through TrueFoundry.
           </p>
         </div>
 
@@ -263,70 +349,91 @@ export function Marketplace() {
             <Separator className="flex-1 bg-white/5" />
           </div>
           <h2 className="text-2xl font-semibold text-white sm:text-3xl">
-            {selected
-              ? `Refine your ${selected.name}`
-              : "Refine your stack"}
+            {selected ? `Refine ${selected.name}` : "Refine your stack"}
           </h2>
           <p className="max-w-2xl text-white/60">
             {selected
               ? selected.description
-              : "Pick a pack above to start customizing the tools your agent gets."}
+              : "Pick a pack above to start narrowing down the tools your agent gets."}
           </p>
+          {selected ? (
+            <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-white/50">
+              <Badge
+                variant="outline"
+                className="border-white/10 bg-white/5 font-mono text-white/70"
+              >
+                {enabledTools.length} of {tools.length} tools enabled
+              </Badge>
+              <Badge
+                variant="outline"
+                className="border-white/10 bg-white/5 font-mono text-white/70"
+              >
+                {countServers(enabledTools)} MCP server
+                {countServers(enabledTools) === 1 ? "" : "s"}
+              </Badge>
+            </div>
+          ) : null}
         </div>
 
         {selected ? (
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-5">
             <Card className="border-white/10 bg-white/[0.02] lg:col-span-3">
               <CardHeader className="pb-4">
-                <CardTitle className="text-white">Included MCP tools</CardTitle>
+                <CardTitle className="text-white">Tool selection</CardTitle>
                 <CardDescription className="text-white/50">
-                  Toggle tools on or off. Add custom MCP servers your agent
-                  needs.
+                  Each tool is a single MCP action. Toggle off whatever your
+                  agent shouldn't call.
                 </CardDescription>
               </CardHeader>
-              <CardContent className="space-y-3">
-                {tools.map((tool) => (
-                  <div
-                    key={tool.id}
-                    className="flex items-center justify-between gap-3 rounded-xl border border-white/5 bg-black/30 px-4 py-3 transition hover:border-white/10"
-                  >
-                    <div className="flex flex-col">
-                      <span className="flex items-center gap-2 font-medium text-white">
-                        {tool.name}
-                        {tool.custom ? (
-                          <Badge
-                            variant="outline"
-                            className="border-white/15 bg-transparent text-[10px] font-normal uppercase tracking-wide text-white/50"
-                          >
-                            custom
-                          </Badge>
-                        ) : null}
-                      </span>
-                      <span className="font-mono text-xs text-white/40">
-                        {tool.id}
-                      </span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <Switch
-                        checked={tool.enabled}
-                        onCheckedChange={() => toggleTool(tool.id)}
-                        aria-label={`Toggle ${tool.name}`}
-                      />
-                      {tool.custom ? (
-                        <Button
+              <CardContent className="space-y-5">
+                {grouped.map(({ server, tools: serverTools }) => {
+                  const enabledCount = serverTools.filter(
+                    (tool) => tool.enabled,
+                  ).length;
+                  const allEnabled = enabledCount === serverTools.length;
+                  return (
+                    <div
+                      key={server.id}
+                      className="rounded-2xl border border-white/5 bg-black/20"
+                    >
+                      <div className="flex items-center justify-between gap-3 border-b border-white/5 px-4 py-3">
+                        <div className="flex items-center gap-3">
+                          <span className="inline-flex size-7 items-center justify-center rounded-md border border-white/10 bg-white/5 font-mono text-[11px] uppercase tracking-wide text-white/70">
+                            {server.id.slice(0, 2)}
+                          </span>
+                          <div className="flex flex-col">
+                            <span className="font-medium text-white">
+                              {server.name}
+                            </span>
+                            <span className="font-mono text-[11px] text-white/40">
+                              {enabledCount}/{serverTools.length} tools enabled
+                            </span>
+                          </div>
+                        </div>
+                        <button
                           type="button"
-                          size="icon"
-                          variant="ghost"
-                          className="size-8 text-white/40 hover:bg-white/10 hover:text-white"
-                          onClick={() => removeTool(tool.id)}
-                          aria-label={`Remove ${tool.name}`}
+                          onClick={() => toggleServer(server.id, !allEnabled)}
+                          className="rounded-md border border-white/10 bg-white/[0.03] px-2.5 py-1 text-[11px] text-white/60 hover:border-white/20 hover:text-white"
                         >
-                          <X className="size-4" />
-                        </Button>
-                      ) : null}
+                          {allEnabled ? "Disable all" : "Enable all"}
+                        </button>
+                      </div>
+                      <div className="flex flex-col">
+                        {serverTools.map((tool, idx) => (
+                          <ToolRow
+                            key={tool.id}
+                            tool={tool}
+                            isLast={idx === serverTools.length - 1}
+                            onToggle={() => toggleTool(tool.id)}
+                            onRemove={
+                              tool.custom ? () => removeTool(tool.id) : undefined
+                            }
+                          />
+                        ))}
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
 
                 <div className="flex flex-col gap-2 pt-1 sm:flex-row">
                   <Input
@@ -335,8 +442,8 @@ export function Marketplace() {
                     onKeyDown={(event) => {
                       if (event.key === "Enter") addCustomTool();
                     }}
-                    placeholder="Add another MCP server (e.g. PostHog)"
-                    className="border-white/10 bg-black/40 text-white placeholder:text-white/30"
+                    placeholder="Add a tool — e.g. github.archive_repo"
+                    className="border-white/10 bg-black/40 font-mono text-white placeholder:text-white/30"
                   />
                   <Button
                     type="button"
@@ -344,7 +451,7 @@ export function Marketplace() {
                     className="gap-2 bg-white text-black hover:bg-white/90"
                   >
                     <Plus className="size-4" />
-                    Add MCP
+                    Add tool
                   </Button>
                 </div>
               </CardContent>
@@ -375,12 +482,26 @@ export function Marketplace() {
                 </pre>
                 <Button
                   type="button"
-                  onClick={copyConfig}
+                  onClick={openInTrueFoundry}
                   className="mt-4 w-full gap-2 bg-white text-black hover:bg-white/90"
+                >
+                  <ExternalLink className="size-4" />
+                  Open in TrueFoundry
+                </Button>
+                <Button
+                  type="button"
+                  onClick={copyConfig}
+                  variant="outline"
+                  className="mt-2 w-full gap-2 border-white/15 bg-white/[0.03] text-white hover:bg-white/10 hover:text-white"
                 >
                   <Copy className="size-4" />
                   Copy TrueFoundry Config
                 </Button>
+                <p className="mt-3 text-center text-[11px] text-white/40">
+                  Install the{" "}
+                  <span className="font-mono text-white/60">extension/</span>{" "}
+                  Chrome extension to auto-tick these tools on TrueFoundry.
+                </p>
               </CardContent>
             </Card>
           </div>
@@ -403,6 +524,70 @@ export function Marketplace() {
   );
 }
 
+function ToolRow({
+  tool,
+  isLast,
+  onToggle,
+  onRemove,
+}: {
+  tool: ToolState;
+  isLast: boolean;
+  onToggle: () => void;
+  onRemove?: () => void;
+}) {
+  const risk = RISK_STYLES[tool.risk];
+  return (
+    <div
+      className={`flex items-start justify-between gap-3 px-4 py-3 transition hover:bg-white/[0.02] ${
+        isLast ? "" : "border-b border-white/5"
+      } ${tool.enabled ? "" : "opacity-60"}`}
+    >
+      <div className="flex min-w-0 flex-col gap-1">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="font-mono text-sm text-white">{tool.name}</span>
+          <Badge
+            variant="outline"
+            className={`gap-1 border bg-transparent text-[10px] font-medium uppercase tracking-wide ${risk.className}`}
+          >
+            {tool.risk === "destructive" ? (
+              <ShieldAlert className="size-2.5" />
+            ) : null}
+            {risk.label}
+          </Badge>
+          {tool.custom ? (
+            <Badge
+              variant="outline"
+              className="border-white/15 bg-transparent text-[10px] font-normal uppercase tracking-wide text-white/50"
+            >
+              custom
+            </Badge>
+          ) : null}
+        </div>
+        <p className="text-xs text-white/50">{tool.description}</p>
+      </div>
+      <div className="flex shrink-0 items-center gap-2 pt-0.5">
+        <Switch
+          checked={tool.enabled}
+          onCheckedChange={onToggle}
+          aria-label={`Toggle ${tool.id}`}
+        />
+        {onRemove ? (
+          <Button
+            type="button"
+            size="icon"
+            variant="ghost"
+            className="size-8 text-white/40 hover:bg-white/10 hover:text-white"
+            onClick={onRemove}
+            aria-label={`Remove ${tool.id}`}
+          >
+            <X className="size-4" />
+          </Button>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 function PackCard({
   pack,
   active,
@@ -414,6 +599,9 @@ function PackCard({
   highlighted: boolean;
   onSelect: () => void;
 }) {
+  const grouped = groupToolsByServer(pack.tools);
+  const toolCount = pack.tools.length;
+  const serverCount = grouped.length;
   return (
     <button
       type="button"
@@ -425,8 +613,14 @@ function PackCard({
       <div
         className={`pointer-events-none absolute inset-x-0 -top-24 h-48 bg-gradient-to-br ${pack.accent} opacity-50 blur-3xl transition group-hover:opacity-80`}
       />
+      {pack.recommended ? (
+        <span className="absolute right-4 top-4 inline-flex items-center gap-1 rounded-full border border-emerald-400/30 bg-emerald-400/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-emerald-200">
+          <Sparkles className="size-2.5" />
+          Recommended
+        </span>
+      ) : null}
       <div className="relative flex items-start justify-between gap-3">
-        <div className="flex flex-col gap-1">
+        <div className="flex flex-col gap-1 pr-20">
           <span className="font-mono text-xs uppercase tracking-[0.18em] text-white/40">
             {pack.slug}
           </span>
@@ -441,16 +635,23 @@ function PackCard({
         )}
       </div>
       <p className="relative text-sm text-white/60">{pack.tagline}</p>
-      <div className="relative flex flex-wrap gap-1.5">
-        {pack.tools.map((tool) => (
-          <Badge
-            key={tool.id}
-            variant="outline"
-            className="border-white/10 bg-white/5 font-normal text-white/70"
-          >
-            {tool.name}
-          </Badge>
-        ))}
+      <div className="relative flex flex-col gap-2">
+        <span className="font-mono text-[11px] uppercase tracking-wide text-white/40">
+          {toolCount} tools · {serverCount} MCP
+          {serverCount === 1 ? "" : "s"}
+        </span>
+        <div className="flex flex-wrap gap-1.5">
+          {grouped.map(({ server, tools: serverTools }) => (
+            <Badge
+              key={server.id}
+              variant="outline"
+              className="border-white/10 bg-white/5 font-normal text-white/70"
+            >
+              {server.name}
+              <span className="ml-1 text-white/40">{serverTools.length}</span>
+            </Badge>
+          ))}
+        </div>
       </div>
       <div className="relative mt-auto inline-flex items-center gap-2 text-sm font-medium text-white/80 group-hover:text-white">
         Use pack
@@ -459,3 +660,4 @@ function PackCard({
     </button>
   );
 }
+
